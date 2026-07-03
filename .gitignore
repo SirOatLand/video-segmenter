@@ -1,2 +1,6 @@
 __pycache__
 .env
+outputs/
+comments/
+.itunes_duration_cache.json
+.completed_songs.json

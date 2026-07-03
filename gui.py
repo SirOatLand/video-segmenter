@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Desktop GUI: scan videos/setlists, review & edit each song's cut points,
-then run ffmpeg to cut them. Built on tkinter (stdlib, no extra installs).
+"""Desktop GUI: list videos/setlists instantly, check the streams (and songs)
+you want, then scan (parse + ffprobe + iTunes lookup) and process (cut) only
+what's checked. Built on tkinter (stdlib, no extra installs).
 
 Usage:
     python gui.py
@@ -15,9 +16,16 @@ from tkinter import filedialog, messagebox, ttk
 from setlist_parser import parse_setlist, parse_timestamp, sanitize
 from duration_lookup import load_duration_cache, save_duration_cache
 from video_tools import VIDEO_EXTENSIONS, probe_duration, cut_segment
-from segment_planner import plan_segments
+from segment_planner import plan_segments, build_output_filename
+from file_matching import build_txt_index, find_txt_for_video, extract_video_id
+from completion_tracker import load_completed, save_completed, is_completed, mark_completed
 
-EDITABLE_COLUMNS = {"#2": "title", "#4": "start", "#5": "end"}
+# song table columns = ("include", "index", "title", "artist", "start", "end", "note")
+SONG_INCLUDE_COLUMN = "#1"
+EDITABLE_COLUMNS = {"#3": "title", "#5": "start", "#6": "end"}
+# stream list columns = ("include", "name")
+STREAM_INCLUDE_COLUMN = "#1"
+CHECK_ON, CHECK_OFF = "☑", "☐"
 
 
 def format_timestamp(seconds: float) -> str:
@@ -27,11 +35,6 @@ def format_timestamp(seconds: float) -> str:
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
-def find_txt_for_video(video_path: Path, txt_dir: Path):
-    candidate = txt_dir / (video_path.stem + ".txt")
-    return candidate if candidate.exists() else None
-
-
 class App:
     def __init__(self, root):
         self.root = root
@@ -39,9 +42,12 @@ class App:
         root.geometry("950x650")
 
         self.duration_cache = load_duration_cache()
-        self.videos_data = {}   # str(video_path) -> {"txt", "duration", "segments"}
-        self.video_order = []   # listbox row index -> str(video_path) or None
-        self.selected_video = None
+        self.completed = load_completed()
+        self.txt_dir = None
+        self.txt_index = {}
+        self.videos_data = {}    # str(video_path) -> {"txt", "duration", "segments"}, only once scanned
+        self.video_checked = {}  # str(video_path) -> bool, checkbox state in the stream list
+        self.selected_video = None  # currently-viewed stream (shown in the song table)
         self.stop_event = threading.Event()
         self.log_queue = queue.Queue()
 
@@ -62,42 +68,55 @@ class App:
 
         opts = ttk.Frame(self.root, padding=(8, 0))
         opts.pack(fill="x")
-        self.use_itunes_var = tk.BooleanVar(value=True)
         self.reencode_var = tk.BooleanVar(value=False)
         self.dry_run_var = tk.BooleanVar(value=False)
         self.overwrite_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(opts, text="Use iTunes duration lookup", variable=self.use_itunes_var).pack(side="left")
-        ttk.Checkbutton(opts, text="Re-encode (frame-accurate)", variable=self.reencode_var).pack(side="left", padx=8)
+        ttk.Checkbutton(opts, text="Re-encode (frame-accurate)", variable=self.reencode_var).pack(side="left")
         ttk.Checkbutton(opts, text="Dry run", variable=self.dry_run_var).pack(side="left", padx=8)
         ttk.Checkbutton(opts, text="Overwrite existing", variable=self.overwrite_var).pack(side="left", padx=8)
 
         btns = ttk.Frame(self.root, padding=8)
         btns.pack(fill="x")
-        self.scan_btn = ttk.Button(btns, text="Scan", command=self.scan)
+        self.scan_btn = ttk.Button(btns, text="Scan Checked Streams", command=self.scan_checked)
         self.scan_btn.pack(side="left")
-        self.run_btn = ttk.Button(btns, text="Run", command=self.run)
-        self.run_btn.pack(side="left", padx=8)
+        self.process_btn = ttk.Button(btns, text="Process Checked Streams", command=self.process_checked)
+        self.process_btn.pack(side="left", padx=8)
         self.stop_btn = ttk.Button(btns, text="Stop", command=self.stop, state="disabled")
         self.stop_btn.pack(side="left")
+        ttk.Button(btns, text="Check All Streams",
+                   command=lambda: self.set_all_streams_checked(True)).pack(side="left", padx=(16, 0))
+        ttk.Button(btns, text="Uncheck All Streams",
+                   command=lambda: self.set_all_streams_checked(False)).pack(side="left", padx=4)
+        ttk.Button(btns, text="Check All Songs",
+                   command=lambda: self.set_all_songs_selected(True)).pack(side="left", padx=(16, 0))
+        ttk.Button(btns, text="Uncheck All Songs",
+                   command=lambda: self.set_all_songs_selected(False)).pack(side="left", padx=4)
 
         main = ttk.Frame(self.root)
         main.pack(fill="both", expand=True, padx=8)
 
-        self.video_list = tk.Listbox(main, width=38)
-        self.video_list.pack(side="left", fill="y")
-        self.video_list.bind("<<ListboxSelect>>", self.on_select_video)
+        video_columns = ("include", "name")
+        self.video_tree = ttk.Treeview(main, columns=video_columns, show="headings")
+        self.video_tree.heading("include", text="")
+        self.video_tree.heading("name", text="Stream")
+        self.video_tree.column("include", width=30, anchor="center")
+        self.video_tree.column("name", width=280, anchor="w")
+        self.video_tree.pack(side="left", fill="y")
+        self.video_tree.bind("<Button-1>", self.on_video_click)
+        self.video_tree.bind("<<TreeviewSelect>>", self.on_select_video)
 
         table_frame = ttk.Frame(main)
         table_frame.pack(side="left", fill="both", expand=True, padx=(8, 0))
 
-        columns = ("index", "title", "artist", "start", "end", "note")
-        widths = (40, 220, 140, 70, 70, 260)
+        columns = ("include", "index", "title", "artist", "start", "end", "note")
+        widths = (30, 40, 220, 140, 70, 70, 260)
         self.tree = ttk.Treeview(table_frame, columns=columns, show="headings")
         for col, width in zip(columns, widths):
-            self.tree.heading(col, text=col.capitalize())
-            self.tree.column(col, width=width)
+            self.tree.heading(col, text="" if col == "include" else col.capitalize())
+            self.tree.column(col, width=width, anchor="center" if col == "include" else "w")
         self.tree.pack(fill="both", expand=True)
         self.tree.bind("<Double-1>", self.on_double_click)
+        self.tree.bind("<Button-1>", self.on_song_click)
 
         bottom = ttk.Frame(self.root, padding=8)
         bottom.pack(fill="x")
@@ -115,8 +134,13 @@ class App:
 
     def _browse(self, var):
         path = filedialog.askdirectory()
-        if path:
-            var.set(path)
+        if not path:
+            return
+        var.set(path)
+        videos_dir_str = self.videos_dir_var.get()
+        txt_dir_str = self.txt_dir_var.get()
+        if videos_dir_str and txt_dir_str and Path(videos_dir_str).is_dir() and Path(txt_dir_str).is_dir():
+            self.list_files()
 
     def log(self, msg):
         self.log_queue.put(msg)
@@ -130,11 +154,17 @@ class App:
             self.log_text.configure(state="disabled")
         self.root.after(100, self._poll_log_queue)
 
-    # ---------------- scanning ----------------
+    # ---------------- lightweight file listing (no ffprobe, no parsing, no network) ----------------
 
-    def scan(self):
-        videos_dir = Path(self.videos_dir_var.get())
-        txt_dir = Path(self.txt_dir_var.get())
+    def list_files(self):
+        videos_dir_str = self.videos_dir_var.get()
+        txt_dir_str = self.txt_dir_var.get()
+        if not videos_dir_str or not txt_dir_str:
+            messagebox.showerror("Error", "Pick both a videos directory and a setlists directory first.")
+            return
+
+        videos_dir = Path(videos_dir_str)
+        txt_dir = Path(txt_dir_str)
         if not videos_dir.is_dir() or not txt_dir.is_dir():
             messagebox.showerror("Error", "Pick valid videos and setlists directories first.")
             return
@@ -144,64 +174,131 @@ class App:
             self.log(f"No video files found in {videos_dir}")
             return
 
-        self.scan_btn.configure(state="disabled")
-        use_itunes = self.use_itunes_var.get()
-        threading.Thread(target=self._scan_worker, args=(videos, txt_dir, use_itunes), daemon=True).start()
-
-    def _scan_worker(self, videos, txt_dir, use_itunes):
-        results = []  # (video_path, txt_path, duration, segments, label)
-        for video_path in videos:
-            txt_path = find_txt_for_video(video_path, txt_dir)
-            if not txt_path:
-                results.append((video_path, None, None, None, "no setlist"))
-                continue
-            entries = parse_setlist(txt_path)
-            if not entries:
-                results.append((video_path, txt_path, None, None, "empty setlist"))
-                continue
-            try:
-                duration = probe_duration(video_path)
-            except subprocess.CalledProcessError as e:
-                self.log(f"ffprobe failed for {video_path.name}: {e.stderr}")
-                results.append((video_path, txt_path, None, None, "ffprobe failed"))
-                continue
-            segments = plan_segments(entries, duration, use_itunes, self.duration_cache)
-            results.append((video_path, txt_path, duration, segments, f"{len(segments)} songs"))
-
-        save_duration_cache(self.duration_cache)
-        self.root.after(0, self._populate_scan_results, results)
-
-    def _populate_scan_results(self, results):
+        self.txt_dir = txt_dir
+        self.txt_index = build_txt_index(txt_dir)
         self.videos_data.clear()
-        self.video_order = []
-        self.video_list.delete(0, "end")
+        self.video_checked.clear()
+        self.selected_video = None
+        self.video_tree.delete(*self.video_tree.get_children())
         self.tree.delete(*self.tree.get_children())
 
-        for video_path, txt_path, duration, segments, label in results:
-            self.video_list.insert("end", f"{video_path.name}  ({label})")
-            if segments is not None:
-                self.videos_data[str(video_path)] = {"txt": txt_path, "duration": duration, "segments": segments}
-                self.video_order.append(str(video_path))
-            else:
-                self.video_order.append(None)
+        for video_path in videos:
+            video_key = str(video_path)
+            txt_path = find_txt_for_video(video_path, txt_dir, self.txt_index)
+            label = "setlist found" if txt_path else "no setlist"
+            self.video_checked[video_key] = False
+            self.video_tree.insert("", "end", iid=video_key, values=(
+                CHECK_OFF, f"{video_path.name}  ({label})",
+            ))
 
-        self.scan_btn.configure(state="normal")
-        self.log(f"Scanned {len(results)} video(s).")
+        self.log(f"Listed {len(videos)} video(s). Check the ones you want, then click "
+                 f"\"Scan Checked Streams\" to parse them and look up song durations.")
 
     def on_select_video(self, event):
-        selection = self.video_list.curselection()
+        selection = self.video_tree.selection()
         if not selection:
             return
-        video_key = self.video_order[selection[0]]
+        self.selected_video = selection[0]
         self.tree.delete(*self.tree.get_children())
-        self.selected_video = video_key
-        if not video_key:
+        if self.selected_video not in self.videos_data:
             return
-        for seg in self.videos_data[video_key]["segments"]:
+        for seg in self.videos_data[self.selected_video]["segments"]:
+            check = CHECK_ON if seg.get("selected", True) else CHECK_OFF
             self.tree.insert("", "end", iid=str(seg["index"]), values=(
-                seg["index"], seg["title"], seg["artist"],
+                check, seg["index"], seg["title"], seg["artist"],
                 format_timestamp(seg["start"]), format_timestamp(seg["end"]), seg["note"],
             ))
+
+    def on_video_click(self, event):
+        region = self.video_tree.identify("region", event.x, event.y)
+        if region != "cell" or self.video_tree.identify_column(event.x) != STREAM_INCLUDE_COLUMN:
+            return
+        row_id = self.video_tree.identify_row(event.y)
+        if not row_id:
+            return
+        self.video_checked[row_id] = not self.video_checked.get(row_id, False)
+        self.video_tree.set(row_id, "include", CHECK_ON if self.video_checked[row_id] else CHECK_OFF)
+
+    def set_all_streams_checked(self, checked: bool):
+        check = CHECK_ON if checked else CHECK_OFF
+        for video_key in self.video_checked:
+            self.video_checked[video_key] = checked
+            self.video_tree.set(video_key, "include", check)
+
+    # ---------------- scanning checked streams (parse + ffprobe + iTunes, cached) ----------------
+
+    def scan_checked(self):
+        checked = [k for k, v in self.video_checked.items() if v]
+        if not checked:
+            messagebox.showinfo("No streams checked", "Check at least one stream in the list on the left first.")
+            return
+
+        self.scan_btn.configure(state="disabled")
+        self.progress.configure(maximum=len(checked), value=0)
+        self.log(f"Scanning {len(checked)} checked stream(s)...")
+        threading.Thread(target=self._scan_checked_worker, args=(checked,), daemon=True).start()
+
+    def _scan_checked_worker(self, checked_keys):
+        try:
+            for i, video_key in enumerate(checked_keys, start=1):
+                video_path = Path(video_key)
+                self.log(f"  [{i}/{len(checked_keys)}] {video_path.name}")
+                self.root.after(0, self._set_progress, i)
+                try:
+                    txt_path = find_txt_for_video(video_path, self.txt_dir, self.txt_index)
+                    if not txt_path:
+                        self.log("    no matching setlist found, skipping")
+                        continue
+                    entries = parse_setlist(txt_path)
+                    if not entries:
+                        self.log("    no setlist entries parsed, skipping")
+                        continue
+                    duration = probe_duration(video_path)
+                    segments = plan_segments(entries, duration, True, self.duration_cache)
+                    video_id = extract_video_id(video_path.stem)
+                    for seg in segments:
+                        seg["selected"] = True
+                        if is_completed(self.completed, video_id, seg["index"]):
+                            seg["note"] = (seg["note"] + "; " if seg["note"] else "") + "already done"
+                    self.videos_data[video_key] = {"txt": txt_path, "duration": duration, "segments": segments}
+                    self.log(f"    found {len(segments)} song(s)")
+                except Exception as e:
+                    self.log(f"    error: {e}")
+        finally:
+            save_duration_cache(self.duration_cache)
+            self.root.after(0, self._on_scan_checked_finished)
+
+    def _on_scan_checked_finished(self):
+        self.scan_btn.configure(state="normal")
+        if self.selected_video in self.videos_data:
+            self.tree.delete(*self.tree.get_children())
+            for seg in self.videos_data[self.selected_video]["segments"]:
+                check = CHECK_ON if seg.get("selected", True) else CHECK_OFF
+                self.tree.insert("", "end", iid=str(seg["index"]), values=(
+                    check, seg["index"], seg["title"], seg["artist"],
+                    format_timestamp(seg["start"]), format_timestamp(seg["end"]), seg["note"],
+                ))
+        self.log("Finished scanning checked streams.")
+
+    def set_all_songs_selected(self, selected: bool):
+        if not self.selected_video or self.selected_video not in self.videos_data:
+            return
+        check = CHECK_ON if selected else CHECK_OFF
+        for seg in self.videos_data[self.selected_video]["segments"]:
+            seg["selected"] = selected
+            self.tree.set(str(seg["index"]), "include", check)
+
+    def on_song_click(self, event):
+        region = self.tree.identify("region", event.x, event.y)
+        if region != "cell" or self.tree.identify_column(event.x) != SONG_INCLUDE_COLUMN:
+            return
+        row_id = self.tree.identify_row(event.y)
+        if not row_id or not self.selected_video:
+            return
+        segments = self.videos_data[self.selected_video]["segments"]
+        seg = next(s for s in segments if s["index"] == int(row_id))
+        seg["selected"] = not seg.get("selected", True)
+        self.tree.set(row_id, "include", CHECK_ON if seg["selected"] else CHECK_OFF)
 
     # ---------------- editing ----------------
 
@@ -250,44 +347,65 @@ class App:
             seg[field] = new_value
             self.tree.set(row_id, field, new_value)
 
-    # ---------------- running ----------------
+    # ---------------- processing (cutting) checked streams ----------------
 
-    def run(self):
-        if not self.videos_data:
-            messagebox.showinfo("Nothing to run", "Scan a folder first.")
+    def process_checked(self):
+        checked_keys = [k for k, v in self.video_checked.items() if v]
+        if not checked_keys:
+            messagebox.showinfo("Nothing to process", "Check at least one stream in the list on the left first.")
             return
         if not self.output_dir_var.get():
             messagebox.showerror("Error", "Pick an output directory first.")
             return
 
+        unscanned = [k for k in checked_keys if k not in self.videos_data]
+        for k in unscanned:
+            self.log(f"{Path(k).name}: checked but not scanned yet, skipping "
+                     f"(click \"Scan Checked Streams\" first)")
+
+        targets = {k: self.videos_data[k] for k in checked_keys if k in self.videos_data}
+        if not targets:
+            messagebox.showinfo("Nothing to process", "None of the checked streams have been scanned yet.")
+            return
+
         output_dir = Path(self.output_dir_var.get())
         self.stop_event.clear()
-        self.run_btn.configure(state="disabled")
+        self.process_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
 
-        total = sum(len(v["segments"]) for v in self.videos_data.values())
+        total = sum(sum(1 for s in v["segments"] if s.get("selected", True)) for v in targets.values())
         self.progress.configure(maximum=max(total, 1), value=0)
 
-        args = (output_dir, self.reencode_var.get(), self.dry_run_var.get(), self.overwrite_var.get())
+        args = (targets, output_dir, self.reencode_var.get(), self.dry_run_var.get(), self.overwrite_var.get())
         threading.Thread(target=self._run_worker, args=args, daemon=True).start()
 
     def stop(self):
         self.stop_event.set()
         self.log("Stop requested, finishing current segment...")
 
-    def _run_worker(self, output_dir, reencode, dry_run, overwrite):
+    def _run_worker(self, videos_to_process, output_dir, reencode, dry_run, overwrite):
         done = 0
-        for video_key, data in self.videos_data.items():
+        for video_key, data in videos_to_process.items():
             if self.stop_event.is_set():
                 break
             video_path = Path(video_key)
             out_subdir = output_dir / sanitize(video_path.stem)
+            video_id = extract_video_id(video_path.stem)
+            selected_segments = [s for s in data["segments"] if s.get("selected", True)]
+            if not selected_segments:
+                continue
             self.log(video_path.name)
 
-            for seg in data["segments"]:
+            for seg in selected_segments:
                 if self.stop_event.is_set():
                     break
                 idx = seg["index"]
+
+                if is_completed(self.completed, video_id, idx):
+                    self.log(f"  [{idx:02d}] '{seg['title']}' already completed (previous run), skipping")
+                    done += 1
+                    self.root.after(0, self._set_progress, done)
+                    continue
 
                 if seg["end"] <= seg["start"]:
                     self.log(f"  [{idx:02d}] skipping '{seg['title']}': non-positive duration")
@@ -295,11 +413,14 @@ class App:
                     self.root.after(0, self._set_progress, done)
                     continue
 
-                filename = f"{idx:02d} - {sanitize(seg['title'])}{video_path.suffix}"
+                filename = build_output_filename(video_path, seg)
                 out_path = out_subdir / filename
 
                 if out_path.exists() and not overwrite:
                     self.log(f"  [{idx:02d}] {filename} already exists, skipping")
+                    if not dry_run:
+                        mark_completed(self.completed, video_id, idx)
+                        save_completed(self.completed)
                     done += 1
                     self.root.after(0, self._set_progress, done)
                     continue
@@ -307,6 +428,9 @@ class App:
                 self.log(f"  [{idx:02d}] {seg['title']} / {seg['artist']}  ({seg['start']}s - {seg['end']}s)")
                 try:
                     cut_segment(video_path, seg["start"], seg["end"], out_path, reencode, dry_run)
+                    if not dry_run:
+                        mark_completed(self.completed, video_id, idx)
+                        save_completed(self.completed)
                 except subprocess.CalledProcessError as e:
                     self.log(f"  ffmpeg failed: {e.stderr}")
 
@@ -320,7 +444,7 @@ class App:
         self.progress.configure(value=value)
 
     def _on_run_finished(self):
-        self.run_btn.configure(state="normal")
+        self.process_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
 
 
