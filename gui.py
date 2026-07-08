@@ -21,7 +21,7 @@ from file_matching import build_txt_index, find_txt_for_video
 
 # song table columns = ("include", "index", "title", "artist", "start", "end", "note")
 SONG_INCLUDE_COLUMN = "#1"
-EDITABLE_COLUMNS = {"#3": "title", "#5": "start", "#6": "end"}
+EDITABLE_COLUMNS = {"#3": "title", "#4": "artist", "#5": "start", "#6": "end"}
 # stream list columns = ("include", "name")
 STREAM_INCLUDE_COLUMN = "#1"
 CHECK_ON, CHECK_OFF = "☑", "☐"
@@ -91,6 +91,10 @@ class App:
                    command=lambda: self.set_all_songs_selected(True)).pack(side="left", padx=(16, 0))
         ttk.Button(btns, text="Uncheck All Songs",
                    command=lambda: self.set_all_songs_selected(False)).pack(side="left", padx=4)
+        ttk.Button(btns, text="Add Manual Segment",
+                   command=self.add_manual_segment).pack(side="left", padx=(16, 0))
+        ttk.Button(btns, text="Remove Selected Segment",
+                   command=self.remove_selected_segment).pack(side="left", padx=4)
 
         main = ttk.Frame(self.root)
         main.pack(fill="both", expand=True, padx=8)
@@ -336,6 +340,54 @@ class App:
         seg = next(s for s in segments if s["index"] == int(row_id))
         seg["selected"] = not seg.get("selected", True)
         self.tree.set(row_id, "include", CHECK_ON if seg["selected"] else CHECK_OFF)
+
+    def add_manual_segment(self):
+        """Last-resort manual cut: add a blank segment to the currently-viewed
+        stream that you fill in yourself (double-click Title/Artist/Start/End),
+        independent of whatever the setlist did or didn't find. Works even on
+        streams with no matching setlist at all."""
+        if not self.selected_video:
+            messagebox.showinfo("No stream selected", "Click a video in the list on the left first.")
+            return
+        if self.video_locked.get(self.selected_video):
+            messagebox.showinfo("Stream locked", "This stream already has an output folder (already uploaded).")
+            return
+
+        if self.selected_video not in self.videos_data:
+            self.videos_data[self.selected_video] = {"txt": None, "duration": None, "segments": []}
+            self.tree.delete(*self.tree.get_children())
+
+        segments = self.videos_data[self.selected_video]["segments"]
+        next_index = max((s["index"] for s in segments), default=0) + 1
+        seg = {
+            "index": next_index,
+            "title": "New Segment",
+            "artist": "",
+            "start": 0,
+            "end": 0,
+            "note": "manually added",
+            "itunes_matched": None,
+            "selected": True,
+        }
+        segments.append(seg)
+        self.tree.insert("", "end", iid=str(next_index), values=(
+            CHECK_ON, next_index, seg["title"], seg["artist"],
+            format_timestamp(seg["start"]), format_timestamp(seg["end"]), seg["note"],
+        ))
+        self.log(f"Added manual segment #{next_index} to {Path(self.selected_video).name} -- "
+                 f"double-click Title/Artist/Start/End to fill it in before processing.")
+
+    def remove_selected_segment(self):
+        if not self.selected_video or self.selected_video not in self.videos_data:
+            return
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showinfo("No song selected", "Click a song row in the table first.")
+            return
+        row_id = selection[0]
+        segments = self.videos_data[self.selected_video]["segments"]
+        segments[:] = [s for s in segments if str(s["index"]) != row_id]
+        self.tree.delete(row_id)
 
     # ---------------- editing ----------------
 
