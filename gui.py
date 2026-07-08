@@ -47,6 +47,8 @@ class App:
         self.txt_index = {}
         self.videos_data = {}    # str(video_path) -> {"txt", "duration", "segments"}, only once scanned
         self.video_checked = {}  # str(video_path) -> bool, checkbox state in the stream list
+        self.video_locked = {}   # str(video_path) -> bool, True if an output folder already exists (already uploaded)
+        self.video_labels = {}   # str(video_path) -> base status label (setlist found/no setlist)
         self.selected_video = None  # currently-viewed stream (shown in the song table)
         self.stop_event = threading.Event()
         self.log_queue = queue.Queue()
@@ -101,6 +103,7 @@ class App:
         self.video_tree.heading("name", text="Stream")
         self.video_tree.column("include", width=30, anchor="center")
         self.video_tree.column("name", width=280, anchor="w")
+        self.video_tree.tag_configure("locked", foreground="#999999")
         self.video_tree.pack(side="left", fill="y")
         self.video_tree.bind("<Button-1>", self.on_video_click)
         self.video_tree.bind("<<TreeviewSelect>>", self.on_select_video)
@@ -141,6 +144,33 @@ class App:
         txt_dir_str = self.txt_dir_var.get()
         if videos_dir_str and txt_dir_str and Path(videos_dir_str).is_dir() and Path(txt_dir_str).is_dir():
             self.list_files()
+        else:
+            self.refresh_output_locks()
+
+    def _output_folder_exists(self, video_path: Path) -> bool:
+        output_dir_str = self.output_dir_var.get()
+        if not output_dir_str:
+            return False
+        return (Path(output_dir_str) / sanitize(video_path.stem)).is_dir()
+
+    def _update_video_row(self, video_key: str):
+        video_path = Path(video_key)
+        locked = self.video_locked.get(video_key, False)
+        label = self.video_labels.get(video_key, "")
+        if locked:
+            label += ", already uploaded"
+        check = CHECK_ON if self.video_checked.get(video_key) else CHECK_OFF
+        self.video_tree.set(video_key, "include", check)
+        self.video_tree.set(video_key, "name", f"{video_path.name}  ({label})")
+        self.video_tree.item(video_key, tags=("locked",) if locked else ())
+
+    def refresh_output_locks(self):
+        for video_key in self.video_checked:
+            locked = self._output_folder_exists(Path(video_key))
+            self.video_locked[video_key] = locked
+            if locked and self.video_checked.get(video_key):
+                self.video_checked[video_key] = False
+            self._update_video_row(video_key)
 
     def log(self, msg):
         self.log_queue.put(msg)
@@ -178,21 +208,28 @@ class App:
         self.txt_index = build_txt_index(txt_dir)
         self.videos_data.clear()
         self.video_checked.clear()
+        self.video_locked.clear()
+        self.video_labels.clear()
         self.selected_video = None
         self.video_tree.delete(*self.video_tree.get_children())
         self.tree.delete(*self.tree.get_children())
 
+        already_uploaded = 0
         for video_path in videos:
             video_key = str(video_path)
             txt_path = find_txt_for_video(video_path, txt_dir, self.txt_index)
-            label = "setlist found" if txt_path else "no setlist"
+            self.video_labels[video_key] = "setlist found" if txt_path else "no setlist"
             self.video_checked[video_key] = False
-            self.video_tree.insert("", "end", iid=video_key, values=(
-                CHECK_OFF, f"{video_path.name}  ({label})",
-            ))
+            self.video_locked[video_key] = self._output_folder_exists(video_path)
+            if self.video_locked[video_key]:
+                already_uploaded += 1
+            self.video_tree.insert("", "end", iid=video_key, values=("", ""))
+            self._update_video_row(video_key)
 
-        self.log(f"Listed {len(videos)} video(s). Check the ones you want, then click "
-                 f"\"Scan Checked Streams\" to parse them and look up song durations.")
+        self.log(f"Listed {len(videos)} video(s)"
+                 f"{f', {already_uploaded} already have an output folder (locked)' if already_uploaded else ''}. "
+                 f"Check the ones you want, then click \"Scan Checked Streams\" to parse them "
+                 f"and look up song durations.")
 
     def on_select_video(self, event):
         selection = self.video_tree.selection()
@@ -216,14 +253,19 @@ class App:
         row_id = self.video_tree.identify_row(event.y)
         if not row_id:
             return
+        if self.video_locked.get(row_id):
+            self.log(f"{Path(row_id).name}: already has an output folder, treating as already "
+                     f"uploaded -- can't check it (delete/move that folder if you want to redo it)")
+            return
         self.video_checked[row_id] = not self.video_checked.get(row_id, False)
         self.video_tree.set(row_id, "include", CHECK_ON if self.video_checked[row_id] else CHECK_OFF)
 
     def set_all_streams_checked(self, checked: bool):
-        check = CHECK_ON if checked else CHECK_OFF
         for video_key in self.video_checked:
+            if checked and self.video_locked.get(video_key):
+                continue
             self.video_checked[video_key] = checked
-            self.video_tree.set(video_key, "include", check)
+            self.video_tree.set(video_key, "include", CHECK_ON if checked else CHECK_OFF)
 
     # ---------------- scanning checked streams (parse + ffprobe + iTunes, cached) ----------------
 
