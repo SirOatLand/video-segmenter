@@ -19,6 +19,13 @@ from setlist_parser import sanitize
 # (e.g. "⧸" for "/").
 FILENAME_SEPARATOR = "｜"
 
+# YouTube's upload title auto-fill strips plain ASCII "[", "]" and "-" out of
+# the suggested title, but doesn't recognize these Unicode lookalikes, so the
+# creator tag and date bracket survive intact until you edit the title yourself.
+BRACKET_OPEN, BRACKET_CLOSE = "［", "］"  # U+FF3B / U+FF3D, full-width square brackets
+DATE_DASH = "–"  # U+2013, en dash
+CREATOR_TAG = "涼海ネモ"
+
 
 def plan_segments(entries, video_duration, use_itunes, duration_cache):
     """entries: list of {"start", "title", "artist", "end"} sorted by start (from setlist_parser).
@@ -63,12 +70,14 @@ def plan_segments(entries, video_duration, use_itunes, duration_cache):
 
 
 def build_output_filename(video_path, seg):
-    """Builds "[date] Title ｜ Artist.ext", appending " (NO MATCH)" before the
-    extension if no iTunes match was found for this song."""
+    """Builds "［涼海ネモ］ Title ｜ Artist ［date］.ext", appending " (NO MATCH)"
+    before the extension if no iTunes match was found for this song."""
     date = extract_date(video_path.stem) or sanitize(video_path.stem)
-    name = f"[{date}] {sanitize(seg['title'])}"
+    date = date.replace("-", DATE_DASH)
+    name = f"{BRACKET_OPEN}{CREATOR_TAG}{BRACKET_CLOSE} {sanitize(seg['title'])}"
     if seg["artist"]:
         name += f" {FILENAME_SEPARATOR} {sanitize(seg['artist'])}"
+    name += f" {BRACKET_OPEN}{date}{BRACKET_CLOSE}"
     if seg["itunes_matched"] is False:
         name += " (NO MATCH)"
     return name + video_path.suffix

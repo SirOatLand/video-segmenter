@@ -17,8 +17,7 @@ from setlist_parser import parse_setlist, parse_timestamp, sanitize
 from duration_lookup import load_duration_cache, save_duration_cache
 from video_tools import VIDEO_EXTENSIONS, probe_duration, cut_segment
 from segment_planner import plan_segments, build_output_filename
-from file_matching import build_txt_index, find_txt_for_video, extract_video_id
-from completion_tracker import load_completed, save_completed, is_completed, mark_completed
+from file_matching import build_txt_index, find_txt_for_video
 
 # song table columns = ("include", "index", "title", "artist", "start", "end", "note")
 SONG_INCLUDE_COLUMN = "#1"
@@ -42,7 +41,6 @@ class App:
         root.geometry("950x650")
 
         self.duration_cache = load_duration_cache()
-        self.completed = load_completed()
         self.txt_dir = None
         self.txt_index = {}
         self.videos_data = {}    # str(video_path) -> {"txt", "duration", "segments"}, only once scanned
@@ -297,11 +295,8 @@ class App:
                         continue
                     duration = probe_duration(video_path)
                     segments = plan_segments(entries, duration, True, self.duration_cache)
-                    video_id = extract_video_id(video_path.stem)
                     for seg in segments:
                         seg["selected"] = True
-                        if is_completed(self.completed, video_id, seg["index"]):
-                            seg["note"] = (seg["note"] + "; " if seg["note"] else "") + "already done"
                     self.videos_data[video_key] = {"txt": txt_path, "duration": duration, "segments": segments}
                     self.log(f"    found {len(segments)} song(s)")
                 except Exception as e:
@@ -432,7 +427,6 @@ class App:
                 break
             video_path = Path(video_key)
             out_subdir = output_dir / sanitize(video_path.stem)
-            video_id = extract_video_id(video_path.stem)
             selected_segments = [s for s in data["segments"] if s.get("selected", True)]
             if not selected_segments:
                 continue
@@ -442,12 +436,6 @@ class App:
                 if self.stop_event.is_set():
                     break
                 idx = seg["index"]
-
-                if is_completed(self.completed, video_id, idx):
-                    self.log(f"  [{idx:02d}] '{seg['title']}' already completed (previous run), skipping")
-                    done += 1
-                    self.root.after(0, self._set_progress, done)
-                    continue
 
                 if seg["end"] <= seg["start"]:
                     self.log(f"  [{idx:02d}] skipping '{seg['title']}': non-positive duration")
@@ -460,9 +448,6 @@ class App:
 
                 if out_path.exists() and not overwrite:
                     self.log(f"  [{idx:02d}] {filename} already exists, skipping")
-                    if not dry_run:
-                        mark_completed(self.completed, video_id, idx)
-                        save_completed(self.completed)
                     done += 1
                     self.root.after(0, self._set_progress, done)
                     continue
@@ -470,9 +455,6 @@ class App:
                 self.log(f"  [{idx:02d}] {seg['title']} / {seg['artist']}  ({seg['start']}s - {seg['end']}s)")
                 try:
                     cut_segment(video_path, seg["start"], seg["end"], out_path, reencode, dry_run)
-                    if not dry_run:
-                        mark_completed(self.completed, video_id, idx)
-                        save_completed(self.completed)
                 except subprocess.CalledProcessError as e:
                     self.log(f"  ffmpeg failed: {e.stderr}")
 

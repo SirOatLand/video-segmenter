@@ -22,13 +22,12 @@ from setlist_parser import parse_setlist, sanitize
 from duration_lookup import load_duration_cache, save_duration_cache
 from video_tools import VIDEO_EXTENSIONS, probe_duration, cut_segment
 from segment_planner import plan_segments, build_output_filename
-from file_matching import build_txt_index, find_txt_for_video, extract_video_id
-from completion_tracker import load_completed, save_completed, is_completed, mark_completed
+from file_matching import build_txt_index, find_txt_for_video
 
 
 def process_video(video_path: Path, txt_path: Path, output_dir: Path,
                    reencode: bool, dry_run: bool, overwrite: bool,
-                   use_itunes: bool, duration_cache: dict, completed: set):
+                   use_itunes: bool, duration_cache: dict):
     entries = parse_setlist(txt_path)
     if not entries:
         print(f"  no setlist entries found in {txt_path.name}, skipping")
@@ -37,16 +36,11 @@ def process_video(video_path: Path, txt_path: Path, output_dir: Path,
     duration = probe_duration(video_path)
     out_subdir = output_dir / sanitize(video_path.stem)
     segments = plan_segments(entries, duration, use_itunes, duration_cache)
-    video_id = extract_video_id(video_path.stem)
 
     for seg in segments:
         idx = seg["index"]
         if seg["note"]:
             print(f"  [{idx:02d}] {seg['note']}")
-
-        if is_completed(completed, video_id, idx):
-            print(f"  [{idx:02d}] '{seg['title']}' already completed (previous run), skipping")
-            continue
 
         if seg["end"] <= seg["start"]:
             print(f"  [{idx:02d}] skipping '{seg['title']}': non-positive duration")
@@ -57,14 +51,10 @@ def process_video(video_path: Path, txt_path: Path, output_dir: Path,
 
         if out_path.exists() and not overwrite:
             print(f"  [{idx:02d}] {filename} already exists, skipping")
-            mark_completed(completed, video_id, idx)
             continue
 
         print(f"  [{idx:02d}] {seg['title']} / {seg['artist']}  ({seg['start']}s - {seg['end']}s)")
         cut_segment(video_path, seg["start"], seg["end"], out_path, reencode, dry_run)
-        if not dry_run:
-            mark_completed(completed, video_id, idx)
-            save_completed(completed)
 
 
 def main():
@@ -90,7 +80,6 @@ def main():
     use_itunes = args.duration_source == "itunes"
     duration_cache = load_duration_cache() if use_itunes else {}
     txt_index = build_txt_index(args.txt_dir)
-    completed = load_completed()
 
     for video_path in videos:
         print(video_path.name)
@@ -100,7 +89,7 @@ def main():
             continue
         try:
             process_video(video_path, txt_path, args.output_dir, args.reencode, args.dry_run,
-                           args.overwrite, use_itunes, duration_cache, completed)
+                           args.overwrite, use_itunes, duration_cache)
         except subprocess.CalledProcessError as e:
             print(f"  ffmpeg/ffprobe failed: {e.stderr}")
         except Exception as e:
